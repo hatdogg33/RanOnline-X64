@@ -1,0 +1,44 @@
+name: Build Ran Online Mobile APK (ARM64)
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26b
+
+      - name: Install Build Tools & Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake
+
+      - name: Build Ran Mobile APK
+        run: |
+          cd RanMobileAndroid
+          chmod +x ./gradlew || true
+          ./gradlew assembleDebug --stacktrace || gradle assembleDebug
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: RanOnlineMobile-arm64-v8a-debug
+          path: RanMobileAndroid/app/build/outputs/apk/debug/*.apk
