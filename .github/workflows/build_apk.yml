@@ -2,7 +2,8 @@ name: Build Ran Online Mobile APK (ARM64)
 
 on:
   push:
-    branches: [ master, main ]
+    branches:
+      - '**'
   workflow_dispatch:
 
 jobs:
@@ -21,24 +22,27 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Set up Gradle 8.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.2'
+
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26b
 
-      - name: Install Build Tools & Ninja
+      - name: Install CMake and Ninja
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build cmake
+          sudo apt-get install -y cmake ninja-build
 
       - name: Build Ran Mobile APK
-        run: |
-          cd RanMobileAndroid
-          chmod +x ./gradlew || true
-          ./gradlew assembleDebug --stacktrace || gradle assembleDebug
+        run: gradle -p RanMobileAndroid assembleDebug --stacktrace
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: RanOnlineMobile-arm64-v8a-debug
           path: RanMobileAndroid/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
