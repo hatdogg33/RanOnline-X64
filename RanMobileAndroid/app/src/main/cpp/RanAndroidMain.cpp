@@ -6,7 +6,6 @@
 #include <GLES3/gl3.h>
 
 #include "MobileTouchSystem.h"
-#include "RanMobileInputBridge.h"
 
 #define LOG_TAG "RanOnlineMobile"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -15,77 +14,135 @@
 static EGLDisplay g_EglDisplay = EGL_NO_DISPLAY;
 static EGLSurface g_EglSurface = EGL_NO_SURFACE;
 static EGLContext g_EglContext = EGL_NO_CONTEXT;
+static ANativeWindow* g_NativeWindow = nullptr;
+static bool g_EglReady = false;
 static int g_ScreenWidth = 1280;
 static int g_ScreenHeight = 720;
+
+static void LogEglError(const char* operation) {
+    const EGLint error = eglGetError();
+    LOGE("%s failed: EGL error 0x%x", operation, error);
+}
 
 extern "C" {
 
 JNIEXPORT void JNICALL
 Java_com_ranonline_mobile_RanNativeActivity_nativeInitSurface(
-    JNIEnv* env, jobject thiz, jobject surface, jint width, jint height) {
-    LOGI("nativeInitSurface called with width: %d, height: %d", width, height);
+    JNIEnv* env, jobject /* thiz */, jobject surface, jint width, jint height) {
+    LOGI("Initializing EGL surface: %d x %d", width, height);
 
     g_ScreenWidth = width;
     g_ScreenHeight = height;
 
-    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-    if (!window) {
-        LOGE("Failed to get ANativeWindow from surface");
+    g_NativeWindow = ANativeWindow_fromSurface(env, surface);
+    if (!g_NativeWindow) {
+        LOGE("ANativeWindow_fromSurface returned null");
         return;
     }
 
     g_EglDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    eglInitialize(g_EglDisplay, nullptr, nullptr);
+    if (g_EglDisplay == EGL_NO_DISPLAY) {
+        LogEglError("eglGetDisplay");
+        ANativeWindow_release(g_NativeWindow);
+        g_NativeWindow = nullptr;
+        return;
+    }
 
-    const EGLint attribs[] = {
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT,
+    if (eglInitialize(g_EglDisplay, nullptr, nullptr) != EGL_TRUE) {
+        LogEglError("eglInitialize");
+        eglTerminate(g_EglDisplay);
+        g_EglDisplay = EGL_NO_DISPLAY;
+        ANativeWindow_release(g_NativeWindow);
+        g_NativeWindow = nullptr;
+        return;
+    }
+
+    const EGLint configAttributes[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT_KHR,
         EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
         EGL_BLUE_SIZE, 8,
         EGL_GREEN_SIZE, 8,
         EGL_RED_SIZE, 8,
-        EGL_DEPTH_SIZE, 24,
+        EGL_DEPTH_SIZE, 16,
         EGL_NONE
     };
 
-    EGLConfig config;
-    EGLint numConfigs;
-    eglChooseConfig(g_EglDisplay, attribs, &config, 1, &numConfigs);
+    EGLConfig config = nullptr;
+    EGLint configCount = 0;
+    if (eglChooseConfig(g_EglDisplay, configAttributes, &config, 1, &configCount) != EGL_TRUE ||
+        configCount < 1) {
+        LogEglError("eglChooseConfig");
+        eglTerminate(g_EglDisplay);
+        g_EglDisplay = EGL_NO_DISPLAY;
+        ANativeWindow_release(g_NativeWindow);
+        g_NativeWindow = nullptr;
+        return;
+    }
 
-    const EGLint contextAttribs[] = {
+    const EGLint contextAttributes[] = {
         EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_NONE
     };
 
-    g_EglContext = eglCreateContext(g_EglDisplay, config, EGL_NO_CONTEXT, contextAttribs);
-    g_EglSurface = eglCreateWindowSurface(g_EglDisplay, config, window, nullptr);
+    g_EglContext = eglCreateContext(g_EglDisplay, config, EGL_NO_CONTEXT, contextAttributes);
+    if (g_EglContext == EGL_NO_CONTEXT) {
+        LogEglError("eglCreateContext");
+        eglTerminate(g_EglDisplay);
+        g_EglDisplay = EGL_NO_DISPLAY;
+        ANativeWindow_release(g_NativeWindow);
+        g_NativeWindow = nullptr;
+        return;
+    }
 
-    eglMakeCurrent(g_EglDisplay, g_EglSurface, g_EglSurface, g_EglContext);
+    g_EglSurface = eglCreateWindowSurface(g_EglDisplay, config, g_NativeWindow, nullptr);
+    if (g_EglSurface == EGL_NO_SURFACE) {
+        LogEglError("eglCreateWindowSurface");
+        eglDestroyContext(g_EglDisplay, g_EglContext);
+        g_EglContext = EGL_NO_CONTEXT;
+        eglTerminate(g_EglDisplay);
+        g_EglDisplay = EGL_NO_DISPLAY;
+        ANativeWindow_release(g_NativeWindow);
+        g_NativeWindow = nullptr;
+        return;
+    }
 
-    glViewport(0, 0, width, height);
-
+    // Do not call eglMakeCurrent here. This JNI method runs on the UI thread,
+    // while nativeRenderFrame runs on the dedicated render thread. EGL contexts
+    // are thread-affine, so the render thread must bind the context itself.
     MobileTouchSystem::GetInstance().Init(width, height);
-    LOGI("Ran Online Mobile Renderer & Touch Subsystem Initialized successfully");
+    g_EglReady = true;
+    LOGI("EGL resources created; context will be bound by the render thread");
 }
 
 JNIEXPORT void JNICALL
 Java_com_ranonline_mobile_RanNativeActivity_nativeRenderFrame(
-    JNIEnv* env, jobject thiz, jfloat elapsedTime) {
+    JNIEnv* /* env */, jobject /* thiz */, jfloat /* elapsedTime */) {
+    if (!g_EglReady || g_EglDisplay == EGL_NO_DISPLAY ||
+        g_EglSurface == EGL_NO_SURFACE || g_EglContext == EGL_NO_CONTEXT) {
+        return;
+    }
 
-    // 1. Update Ran Mobile Touch Movement and Action inputs
-    RanMobileInputBridge::GetInstance().UpdateMovementAndActions(elapsedTime);
+    // Bind the EGL context on the same thread that issues GLES commands.
+    if (eglGetCurrentContext() != g_EglContext) {
+        if (eglMakeCurrent(g_EglDisplay, g_EglSurface, g_EglSurface, g_EglContext) != EGL_TRUE) {
+            LogEglError("eglMakeCurrent on render thread");
+            return;
+        }
+        LOGI("EGL context bound to render thread");
+    }
 
-    // 2. Render background / frame
-    glClearColor(0.22f, 0.35f, 0.50f, 1.0f); // Ran Online classic sky clear color
+    glViewport(0, 0, g_ScreenWidth, g_ScreenHeight);
+    glClearColor(0.08f, 0.10f, 0.14f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-    // 3. Swap buffers
-    eglSwapBuffers(g_EglDisplay, g_EglSurface);
+    if (eglSwapBuffers(g_EglDisplay, g_EglSurface) != EGL_TRUE) {
+        LogEglError("eglSwapBuffers");
+    }
 }
 
 JNIEXPORT void JNICALL
 Java_com_ranonline_mobile_RanNativeActivity_nativeTouchEvent(
-    JNIEnv* env, jobject thiz, jint action, jint pointerId, jfloat x, jfloat y) {
-
+    JNIEnv* /* env */, jobject /* thiz */, jint action, jint pointerId, jfloat x, jfloat y) {
     TouchEventType type;
     switch (action) {
         case 0: type = TouchEventType::DOWN; break;
@@ -99,17 +156,32 @@ Java_com_ranonline_mobile_RanNativeActivity_nativeTouchEvent(
 
 JNIEXPORT void JNICALL
 Java_com_ranonline_mobile_RanNativeActivity_nativeDestroySurface(
-    JNIEnv* env, jobject thiz) {
+    JNIEnv* /* env */, jobject /* thiz */) {
+    g_EglReady = false;
+
     if (g_EglDisplay != EGL_NO_DISPLAY) {
+        // The Java render thread is joined before this method is called.
         eglMakeCurrent(g_EglDisplay, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (g_EglSurface != EGL_NO_SURFACE) eglDestroySurface(g_EglDisplay, g_EglSurface);
-        if (g_EglContext != EGL_NO_CONTEXT) eglDestroyContext(g_EglDisplay, g_EglContext);
+
+        if (g_EglSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(g_EglDisplay, g_EglSurface);
+        }
+        if (g_EglContext != EGL_NO_CONTEXT) {
+            eglDestroyContext(g_EglDisplay, g_EglContext);
+        }
         eglTerminate(g_EglDisplay);
     }
+
     g_EglDisplay = EGL_NO_DISPLAY;
     g_EglSurface = EGL_NO_SURFACE;
     g_EglContext = EGL_NO_CONTEXT;
-    LOGI("Ran Online Mobile Renderer Destroyed");
+
+    if (g_NativeWindow) {
+        ANativeWindow_release(g_NativeWindow);
+        g_NativeWindow = nullptr;
+    }
+
+    LOGI("EGL resources destroyed");
 }
 
 }
